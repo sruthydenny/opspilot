@@ -1,873 +1,1153 @@
 "use client";
 
-import { useState } from "react";
+import {
+  FormEvent,
+  useSyncExternalStore,
+  useState,
+} from "react";
 
-type TraceItem = {
-  step: number;
-  type: string;
-  tool?: string;
-  content?: string;
-  result?: Record<string, unknown>;
+const API_URL = "http://localhost:8000";
+
+const STORAGE_KEYS = {
+  token: "opspilot_token",
+  user: "opspilot_user",
+  projects: "opspilot_projects",
+  selectedProject: "opspilot_selected_project",
 };
 
-type AgentResponse = {
-  goal: string;
-  status: string;
-  trace: TraceItem[];
-  steps: number;
+type User = {
+  id: number;
+  email: string;
+};
+
+type Project = {
+  id: number;
+  name: string;
+  repository_url?: string | null;
+  application_url?: string | null;
+  health_endpoint?: string | null;
+  environment: string;
+  deployment_status: string;
+  current_version: string;
 };
 
 type Approval = {
-  id: string;
+  id: number;
   status: string;
   tool: string;
   arguments: Record<string, unknown>;
   result?: Record<string, unknown>;
 };
 
-type HealthState = {
+type AgentResponse = {
+  goal: string;
   status: string;
-  service?: string;
-  version?: string;
+  trace: Array<Record<string, unknown>>;
+  steps: number;
+  approval_required?: {
+    approval_id?: string;
+    tool?: string;
+    status?: string;
+    arguments?: Record<string, unknown>;
+  };
 };
 
-const API_URL = "http://localhost:8000";
+function getStorageSnapshot(key: string): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  return window.localStorage.getItem(key) ?? "";
+}
+
+function subscribeToStorage(
+  key: string,
+  callback: () => void
+): () => void {
+  if (typeof window === "undefined") {
+    return () => {};
+  }
+
+  const eventName = `opspilot-storage-${key}`;
+
+  const handler = () => {
+    callback();
+  };
+
+  window.addEventListener("storage", handler);
+  window.addEventListener(eventName, handler);
+
+  return () => {
+    window.removeEventListener("storage", handler);
+    window.removeEventListener(eventName, handler);
+  };
+}
+
+function useStoredValue(key: string): string {
+  return useSyncExternalStore(
+    (callback) => subscribeToStorage(key, callback),
+    () => getStorageSnapshot(key),
+    () => ""
+  );
+}
+
+function writeStorage(key: string, value: string): void {
+  localStorage.setItem(key, value);
+
+  window.dispatchEvent(
+    new Event(`opspilot-storage-${key}`)
+  );
+}
+
+function removeStorage(key: string): void {
+  localStorage.removeItem(key);
+
+  window.dispatchEvent(
+    new Event(`opspilot-storage-${key}`)
+  );
+}
+
+function parseStoredValue<T>(
+  value: string,
+  fallback: T
+): T {
+  if (!value) {
+    return fallback;
+  }
+
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
 
 export default function Home() {
+  const token = useStoredValue(STORAGE_KEYS.token);
+
+  const userRaw = useStoredValue(STORAGE_KEYS.user);
+  const projectsRaw = useStoredValue(STORAGE_KEYS.projects);
+  const selectedProjectRaw = useStoredValue(
+    STORAGE_KEYS.selectedProject
+  );
+
+  const user = parseStoredValue<User | null>(
+    userRaw,
+    null
+  );
+
+  const projects = parseStoredValue<Project[]>(
+    projectsRaw,
+    []
+  );
+
+  const selectedProjectId = selectedProjectRaw
+    ? Number(selectedProjectRaw)
+    : null;
+
+  const selectedProject =
+    projects.find(
+      (project) => project.id === selectedProjectId
+    ) ?? null;
+
+  const [authMode, setAuthMode] = useState<
+    "login" | "register"
+  >("login");
+
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+
+  const [projectName, setProjectName] = useState("");
+  const [repositoryUrl, setRepositoryUrl] = useState("");
+  const [applicationUrl, setApplicationUrl] = useState("");
+  const [healthEndpoint, setHealthEndpoint] = useState("");
+  const [environment, setEnvironment] =
+    useState("production");
+
   const [goal, setGoal] = useState(
     "Investigate the current application incident and determine the likely cause and appropriate remediation."
   );
 
-  const [agentResult, setAgentResult] = useState<AgentResponse | null>(null);
-  const [approval, setApproval] = useState<Approval | null>(null);
-  const [deployment, setDeployment] = useState<HealthState | null>(null);
-  const [health, setHealth] = useState<HealthState | null>(null);
+  const [agentResult, setAgentResult] =
+    useState<AgentResponse | null>(null);
+
+  const [approvals, setApprovals] = useState<
+    Approval[]
+  >([]);
 
   const [loading, setLoading] = useState(false);
-  const [approvalLoading, setApprovalLoading] = useState(false);
-  const [approvalLoadingState, setApprovalLoadingState] = useState(false);
-  const [recoveryLoading, setRecoveryLoading] = useState(false);
+  const [message, setMessage] = useState("");
 
-  const [error, setError] = useState("");
-
-  async function runAgent() {
-    setLoading(true);
-    setError("");
-
+  async function loadProjects(
+    authToken: string,
+    selectFirst = false
+  ) {
     try {
-      const response = await fetch(`${API_URL}/api/agent/run`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ goal }),
-      });
+      const response = await fetch(
+        `${API_URL}/api/projects`,
+        {
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+          },
+        }
+      );
+
+      const data = await response.json();
 
       if (!response.ok) {
-        const body = await response.text();
-
         throw new Error(
-          body || `Agent request failed with status ${response.status}.`
+          data.detail || "Unable to load projects."
         );
       }
 
-      const data: AgentResponse = await response.json();
+      const nextProjects: Project[] = data.projects ?? [];
 
-      setAgentResult(data);
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Something went wrong while contacting OpsPilot."
+      writeStorage(
+        STORAGE_KEYS.projects,
+        JSON.stringify(nextProjects)
+      );
+
+      if (selectFirst && nextProjects.length > 0) {
+        writeStorage(
+          STORAGE_KEYS.selectedProject,
+          String(nextProjects[0].id)
+        );
+      }
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to load projects."
+      );
+    }
+  }
+
+  async function handleAuth(event: FormEvent) {
+    event.preventDefault();
+
+    setLoading(true);
+    setMessage("");
+
+    try {
+      const endpoint =
+        authMode === "login"
+          ? "/api/auth/login"
+          : "/api/auth/register";
+
+      const response = await fetch(
+        `${API_URL}${endpoint}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            email,
+            password,
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail || "Authentication failed."
+        );
+      }
+
+      writeStorage(
+        STORAGE_KEYS.token,
+        data.token
+      );
+
+      writeStorage(
+        STORAGE_KEYS.user,
+        JSON.stringify(data.user)
+      );
+
+      setEmail("");
+      setPassword("");
+      setMessage("");
+
+      await loadProjects(data.token, true);
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Authentication failed."
       );
     } finally {
       setLoading(false);
     }
   }
 
-  async function loadApprovals() {
-    setApprovalLoadingState(true);
-    setError("");
+  async function createProject(event: FormEvent) {
+    event.preventDefault();
 
-    try {
-      const response = await fetch(`${API_URL}/api/approvals`);
-
-      if (!response.ok) {
-        throw new Error("Could not load approval requests.");
-      }
-
-      const data = await response.json();
-
-      const pendingApproval = data.approvals.find(
-        (item: Approval) =>
-          item.status === "pending" &&
-          item.tool === "rollback_deployment"
-      );
-
-      if (pendingApproval) {
-        setApproval(pendingApproval);
-      } else {
-        setApproval(null);
-      }
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Could not load approval requests."
-      );
-    } finally {
-      setApprovalLoadingState(false);
-    }
-  }
-
-  async function createApproval() {
-    setApprovalLoading(true);
-    setError("");
-
-    try {
-      const response = await fetch(`${API_URL}/api/approvals`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          tool: "rollback_deployment",
-          arguments: {},
-        }),
-      });
-
-      if (!response.ok) {
-        const body = await response.text();
-
-        throw new Error(
-          body || "Could not create approval request."
-        );
-      }
-
-      const data: Approval = await response.json();
-
-      setApproval(data);
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Could not create approval request."
-      );
-    } finally {
-      setApprovalLoading(false);
-    }
-  }
-
-  async function approveRollback() {
-    if (!approval) {
+    if (!token) {
       return;
     }
 
-    setApprovalLoading(true);
-    setError("");
+    setLoading(true);
+    setMessage("");
 
     try {
       const response = await fetch(
-        `${API_URL}/api/approvals/${approval.id}/approve`,
+        `${API_URL}/api/projects`,
         {
           method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            name: projectName,
+            repository_url:
+              repositoryUrl || null,
+            application_url:
+              applicationUrl || null,
+            health_endpoint:
+              healthEndpoint || null,
+            environment,
+          }),
         }
       );
 
-      if (!response.ok) {
-        const body = await response.text();
+      const data = await response.json();
 
+      if (!response.ok) {
         throw new Error(
-          body || `Approval failed with status ${response.status}.`
+          data.detail || "Unable to create project."
         );
       }
 
-      const data: Approval = await response.json();
+      setProjectName("");
+      setRepositoryUrl("");
+      setApplicationUrl("");
+      setHealthEndpoint("");
 
-      setApproval(data);
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Rollback approval failed."
+      writeStorage(
+        STORAGE_KEYS.selectedProject,
+        String(data.id)
+      );
+
+      await loadProjects(token);
+
+      setMessage(
+        "Project created successfully."
+      );
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to create project."
       );
     } finally {
-      setApprovalLoading(false);
+      setLoading(false);
     }
   }
 
-  async function verifyRecovery() {
-    setRecoveryLoading(true);
-    setError("");
+  async function simulateIncident() {
+    if (!selectedProject || !token) {
+      return;
+    }
+
+    setLoading(true);
+    setMessage("");
 
     try {
-      const [deploymentResponse, healthResponse] = await Promise.all([
-        fetch(
-          `${API_URL}/api/agent/tools/get_deployment_status/execute`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({}),
-          }
-        ),
-        fetch(
-          `${API_URL}/api/agent/tools/get_application_health/execute`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({}),
-          }
-        ),
-      ]);
+      const response = await fetch(
+        `${API_URL}/api/projects/${selectedProject.id}/simulate-incident`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
 
-      if (!deploymentResponse.ok || !healthResponse.ok) {
-        throw new Error("Recovery verification failed.");
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail ||
+            "Unable to simulate incident."
+        );
       }
 
-      const deploymentData = await deploymentResponse.json();
-      const healthData = await healthResponse.json();
+      await loadProjects(token);
 
-      setDeployment(deploymentData);
-      setHealth(healthData);
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Recovery verification failed."
+      setMessage(
+        "Incident simulated for the selected project."
+      );
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to simulate incident."
       );
     } finally {
-      setRecoveryLoading(false);
+      setLoading(false);
     }
   }
 
-  function getTraceIcon(type: string) {
-    if (type === "goal") return "🎯";
-    if (type === "tool_call") return "🔧";
-    if (type === "observation") return "🔍";
-    if (type === "final_answer") return "🤖";
+  async function runAgent() {
+    if (!selectedProject || !token) {
+      return;
+    }
 
-    return "•";
+    setLoading(true);
+    setMessage("");
+    setAgentResult(null);
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/projects/${selectedProject.id}/agent/run`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            goal,
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail ||
+            data.message ||
+            "Agent request failed."
+        );
+      }
+
+      setAgentResult(data);
+
+      if (data.approval_required) {
+        setMessage(
+          "OpsPilot recommends an action requiring approval."
+        );
+
+        await loadApprovals(
+          selectedProject.id
+        );
+      } else {
+        setMessage(
+          "OpsPilot completed the investigation."
+        );
+      }
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Agent request failed."
+      );
+    } finally {
+      setLoading(false);
+    }
   }
 
-  const rollbackApproved = approval?.status === "approved";
+  async function loadApprovals(projectId: number) {
+    if (!token) {
+      return;
+    }
 
-  const recoveryVerified =
-    deployment?.status === "healthy" &&
-    health?.status === "healthy";
+    try {
+      const response = await fetch(
+        `${API_URL}/api/projects/${projectId}/approvals`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
 
-  return (
-    <main className="min-h-screen bg-slate-950 text-white">
-      {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-950/90">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-5">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-cyan-500/15 text-xl">
-              ⚡
-            </div>
+      const data = await response.json();
 
-            <div>
-              <h1 className="text-xl font-bold tracking-tight">
+      if (!response.ok) {
+        throw new Error(
+          data.detail ||
+            "Unable to load approvals."
+        );
+      }
+
+      setApprovals(data.approvals ?? []);
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to load approvals."
+      );
+    }
+  }
+
+  async function createRollbackApproval() {
+    if (!selectedProject || !token) {
+      return;
+    }
+
+    setLoading(true);
+    setMessage("");
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/projects/${selectedProject.id}/approvals`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            tool: "rollback_deployment",
+            arguments: {},
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail ||
+            "Unable to create approval."
+        );
+      }
+
+      await loadApprovals(
+        selectedProject.id
+      );
+
+      setMessage(
+        `Approval request #${data.id} created.`
+      );
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to create approval."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function approveRollback(
+    approvalId: number
+  ) {
+    if (!selectedProject || !token) {
+      return;
+    }
+
+    setLoading(true);
+    setMessage("");
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/projects/${selectedProject.id}/approvals/${approvalId}/approve`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail ||
+            "Unable to approve action."
+        );
+      }
+
+      await loadApprovals(
+        selectedProject.id
+      );
+
+      await loadProjects(token);
+
+      setMessage(
+        "Rollback approved and executed."
+      );
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to approve action."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function selectProject(projectId: number) {
+    writeStorage(
+      STORAGE_KEYS.selectedProject,
+      String(projectId)
+    );
+
+    setAgentResult(null);
+
+    void loadApprovals(projectId);
+  }
+
+  function logout() {
+    removeStorage(STORAGE_KEYS.token);
+    removeStorage(STORAGE_KEYS.user);
+    removeStorage(STORAGE_KEYS.projects);
+    removeStorage(STORAGE_KEYS.selectedProject);
+
+    setAgentResult(null);
+    setApprovals([]);
+    setMessage("");
+  }
+
+  if (!token || !user) {
+    return (
+      <main className="min-h-screen bg-slate-950 text-white">
+        <div className="mx-auto flex min-h-screen max-w-md items-center px-6">
+          <div className="w-full rounded-2xl border border-slate-800 bg-slate-900 p-8 shadow-2xl">
+            <div className="mb-8">
+              <p className="text-sm font-medium text-cyan-400">
+                Agentic DevOps Platform
+              </p>
+
+              <h1 className="mt-2 text-3xl font-bold">
                 OpsPilot
               </h1>
 
-              <p className="text-xs text-slate-400">
-                Agentic DevOps Operations
+              <p className="mt-2 text-sm text-slate-400">
+                Connect your projects and let OpsPilot
+                investigate operational problems.
               </p>
             </div>
-          </div>
 
-          <div className="flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-sm text-emerald-400">
-            <span className="h-2 w-2 rounded-full bg-emerald-400" />
-            Agent Online
+            <div className="mb-6 flex rounded-lg bg-slate-800 p-1">
+              <button
+                className={`flex-1 rounded-md px-4 py-2 text-sm ${
+                  authMode === "login"
+                    ? "bg-cyan-500 text-slate-950"
+                    : "text-slate-400"
+                }`}
+                onClick={() =>
+                  setAuthMode("login")
+                }
+              >
+                Login
+              </button>
+
+              <button
+                className={`flex-1 rounded-md px-4 py-2 text-sm ${
+                  authMode === "register"
+                    ? "bg-cyan-500 text-slate-950"
+                    : "text-slate-400"
+                }`}
+                onClick={() =>
+                  setAuthMode("register")
+                }
+              >
+                Register
+              </button>
+            </div>
+
+            <form
+              onSubmit={handleAuth}
+              className="space-y-4"
+            >
+              <input
+                type="email"
+                placeholder="Email"
+                value={email}
+                onChange={(event) =>
+                  setEmail(event.target.value)
+                }
+                required
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none focus:border-cyan-400"
+              />
+
+              <input
+                type="password"
+                placeholder="Password"
+                value={password}
+                onChange={(event) =>
+                  setPassword(event.target.value)
+                }
+                required
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none focus:border-cyan-400"
+              />
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full rounded-lg bg-cyan-500 px-4 py-3 font-semibold text-slate-950 disabled:opacity-50"
+              >
+                {loading
+                  ? "Please wait..."
+                  : authMode === "login"
+                    ? "Login"
+                    : "Create Account"}
+              </button>
+            </form>
+
+            {message && (
+              <p className="mt-4 rounded-lg bg-slate-800 p-3 text-sm text-slate-300">
+                {message}
+              </p>
+            )}
           </div>
         </div>
-      </header>
+      </main>
+    );
+  }
 
+  return (
+    <main className="min-h-screen bg-slate-950 text-white">
       <div className="mx-auto max-w-7xl px-6 py-8">
-        {/* System status */}
-        <section className="mb-8 grid gap-4 md:grid-cols-3">
-          <StatusCard
-            title="API"
-            value="Healthy"
-            detail="FastAPI service"
-          />
-
-          <StatusCard
-            title="Database"
-            value="Connected"
-            detail="PostgreSQL"
-          />
-
-          <StatusCard
-            title="Agent"
-            value="Ready"
-            detail="LLM + tool calling"
-          />
-        </section>
-
-        {/* Main panels */}
-        <section className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-          {/* Investigation panel */}
-          <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6 shadow-xl">
-            <div className="mb-6 flex items-start justify-between">
-              <div>
-                <p className="mb-1 text-xs font-semibold uppercase tracking-widest text-cyan-400">
-                  Incident investigation
-                </p>
-
-                <h2 className="text-2xl font-bold">
-                  Autonomous DevOps Investigation
-                </h2>
-
-                <p className="mt-2 max-w-xl text-sm leading-6 text-slate-400">
-                  OpsPilot investigates application health, logs, and
-                  deployment state before recommending remediation.
-                </p>
-              </div>
-
-              <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-400">
-                INCIDENT
-              </div>
-            </div>
-
-            <label className="mb-2 block text-sm font-medium text-slate-300">
-              Agent goal
-            </label>
-
-            <textarea
-              value={goal}
-              onChange={(event) => setGoal(event.target.value)}
-              rows={5}
-              className="w-full resize-none rounded-xl border border-slate-700 bg-slate-950 p-4 text-sm text-slate-200 outline-none transition focus:border-cyan-500"
-            />
-
-            <button
-              onClick={runAgent}
-              disabled={loading || !goal.trim()}
-              className="mt-4 w-full rounded-xl bg-cyan-500 px-5 py-3 font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {loading ? "Agent Investigating..." : "Run OpsPilot Agent"}
-            </button>
-
-            <button
-              onClick={loadApprovals}
-              disabled={approvalLoadingState}
-              className="mt-3 w-full rounded-xl border border-slate-700 bg-slate-950 px-5 py-3 font-semibold text-slate-300 transition hover:border-cyan-500 hover:text-cyan-300 disabled:opacity-50"
-            >
-              {approvalLoadingState
-                ? "Loading Approvals..."
-                : "Load Pending Approvals"}
-            </button>
-
-            {error && (
-              <div className="mt-4 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">
-                {error}
-              </div>
-            )}
-          </div>
-
-          {/* Environment panel */}
-          <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
-            <p className="mb-1 text-xs font-semibold uppercase tracking-widest text-cyan-400">
-              Current environment
+        <header className="flex flex-col gap-4 border-b border-slate-800 pb-6 md:flex-row md:items-center md:justify-between">
+          <div>
+            <p className="text-sm font-medium text-cyan-400">
+              Agentic DevOps Platform
             </p>
 
-            <h2 className="text-xl font-bold">Development</h2>
+            <h1 className="text-3xl font-bold">
+              OpsPilot
+            </h1>
 
-            <div className="mt-6 space-y-4">
-              <InfoRow
-                label="Service"
-                value="opspilot-api"
-              />
+            <p className="mt-1 text-sm text-slate-400">
+              Supervise AI-powered incident investigation
+              and controlled remediation.
+            </p>
+          </div>
 
-              <InfoRow
-                label="Deployment"
-                value={rollbackApproved ? "1.0.0" : "1.0.1"}
-                valueClass={
-                  rollbackApproved
-                    ? "text-emerald-400"
-                    : "text-red-400"
-                }
-              />
+          <div className="flex items-center gap-3">
+            <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-400">
+              {user.email}
+            </span>
 
-              <InfoRow
-                label="Health"
-                value={recoveryVerified ? "Healthy" : "Unhealthy"}
-                valueClass={
-                  recoveryVerified
-                    ? "text-emerald-400"
-                    : "text-red-400"
-                }
-              />
+            <button
+              onClick={logout}
+              className="rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:border-slate-500"
+            >
+              Logout
+            </button>
+          </div>
+        </header>
 
-              <InfoRow
-                label="Error rate"
-                value={recoveryVerified ? "Normal" : "High"}
-                valueClass={
-                  recoveryVerified
-                    ? "text-emerald-400"
-                    : "text-red-400"
-                }
-              />
+        {message && (
+          <div className="mt-6 rounded-xl border border-slate-800 bg-slate-900 p-4 text-sm text-slate-300">
+            {message}
+          </div>
+        )}
 
-              <InfoRow
-                label="Incident"
-                value={
-                  recoveryVerified
-                    ? "Resolved"
-                    : "Database connectivity"
-                }
-                valueClass={
-                  recoveryVerified
-                    ? "text-emerald-400"
-                    : "text-amber-400"
-                }
-              />
+        <section className="mt-6 grid gap-6 lg:grid-cols-[320px_1fr]">
+          <aside className="space-y-6">
+            <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
+              <div className="flex items-center justify-between">
+                <h2 className="font-semibold">
+                  My Projects
+                </h2>
+
+                <button
+                  onClick={() =>
+                    void loadProjects(token)
+                  }
+                  className="text-xs text-cyan-400"
+                >
+                  Refresh
+                </button>
+              </div>
+
+              <div className="mt-4 space-y-2">
+                {projects.length === 0 ? (
+                  <p className="text-sm text-slate-500">
+                    No projects yet.
+                  </p>
+                ) : (
+                  projects.map((project) => (
+                    <button
+                      key={project.id}
+                      onClick={() =>
+                        selectProject(project.id)
+                      }
+                      className={`w-full rounded-xl border px-4 py-3 text-left ${
+                        selectedProject?.id ===
+                        project.id
+                          ? "border-cyan-400 bg-cyan-500/10"
+                          : "border-slate-800 bg-slate-950"
+                      }`}
+                    >
+                      <p className="font-medium">
+                        {project.name}
+                      </p>
+
+                      <p className="mt-1 text-xs text-slate-500">
+                        {project.environment}
+                      </p>
+
+                      <p className="mt-2 text-xs text-slate-400">
+                        {project.deployment_status}
+                      </p>
+                    </button>
+                  ))
+                )}
+              </div>
             </div>
 
-            {!approval && (
-              <div className="mt-6 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
-                <p className="text-sm font-semibold text-amber-300">
-                  No approval loaded
-                </p>
-
-                <p className="mt-1 text-xs leading-5 text-slate-400">
-                  Load the pending approval from the OpsPilot backend.
-                </p>
-
-                <button
-                  onClick={createApproval}
-                  disabled={approvalLoading}
-                  className="mt-4 w-full rounded-lg bg-amber-400 px-4 py-2.5 text-sm font-bold text-slate-950 transition hover:bg-amber-300 disabled:opacity-50"
-                >
-                  {approvalLoading
-                    ? "Creating Approval..."
-                    : "Create Rollback Approval"}
-                </button>
-              </div>
-            )}
-
-            {approval && !rollbackApproved && (
-              <div className="mt-6 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
-                <p className="text-sm font-semibold text-amber-300">
-                  ⚠ Human approval required
-                </p>
-
-                <p className="mt-1 text-xs leading-5 text-slate-400">
-                  Action: rollback deployment
-                </p>
-
-                <p className="mt-1 text-xs text-slate-500">
-                  Approval ID: {approval.id}
-                </p>
-
-                <button
-                  onClick={approveRollback}
-                  disabled={approvalLoading}
-                  className="mt-4 w-full rounded-lg bg-amber-400 px-4 py-2.5 text-sm font-bold text-slate-950 transition hover:bg-amber-300 disabled:opacity-50"
-                >
-                  {approvalLoading
-                    ? "Approving Rollback..."
-                    : "Approve Rollback"}
-                </button>
-              </div>
-            )}
-
-            {rollbackApproved && !recoveryVerified && (
-              <div className="mt-6 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4">
-                <p className="text-sm font-semibold text-emerald-300">
-                  ✓ Rollback completed
-                </p>
-
-                <p className="mt-1 text-xs leading-5 text-slate-400">
-                  Deployment was rolled back from 1.0.1 to 1.0.0.
-                </p>
-
-                <button
-                  onClick={verifyRecovery}
-                  disabled={recoveryLoading}
-                  className="mt-4 w-full rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-bold text-slate-950 transition hover:bg-emerald-300 disabled:opacity-50"
-                >
-                  {recoveryLoading
-                    ? "Verifying Recovery..."
-                    : "Verify Recovery"}
-                </button>
-              </div>
-            )}
-
-            {recoveryVerified && (
-              <div className="mt-6 rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4">
-                <p className="text-sm font-semibold text-emerald-300">
-                  ✓ Recovery verified
-                </p>
-
-                <p className="mt-1 text-xs leading-5 text-slate-400">
-                  Deployment and application health are both healthy.
-                </p>
-              </div>
-            )}
-          </div>
-        </section>
-
-        {/* Agent trace */}
-        <section className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
-          <div className="mb-6 flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-widest text-cyan-400">
-                Agent execution
-              </p>
-
-              <h2 className="mt-1 text-xl font-bold">
-                Investigation Trace
+            <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
+              <h2 className="font-semibold">
+                Add Project
               </h2>
-            </div>
 
-            {agentResult && (
-              <div className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-400">
-                {agentResult.steps} agent steps
-              </div>
-            )}
-          </div>
+              <form
+                onSubmit={createProject}
+                className="mt-4 space-y-3"
+              >
+                <input
+                  placeholder="Project name"
+                  value={projectName}
+                  onChange={(event) =>
+                    setProjectName(
+                      event.target.value
+                    )
+                  }
+                  required
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
+                />
 
-          {!agentResult ? (
-            <div className="rounded-xl border border-dashed border-slate-700 p-8 text-center">
-              <div className="text-3xl">🤖</div>
+                <input
+                  placeholder="GitHub repository URL"
+                  value={repositoryUrl}
+                  onChange={(event) =>
+                    setRepositoryUrl(
+                      event.target.value
+                    )
+                  }
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
+                />
 
-              <p className="mt-3 font-medium text-slate-300">
-                No investigation running
-              </p>
+                <input
+                  placeholder="Application URL"
+                  value={applicationUrl}
+                  onChange={(event) =>
+                    setApplicationUrl(
+                      event.target.value
+                    )
+                  }
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
+                />
 
-              <p className="mt-1 text-sm text-slate-500">
-                Run the agent to see its tool calls, observations,
-                and final assessment.
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {agentResult.trace.map((item, index) => (
-                <div
-                  key={`${item.step}-${index}`}
-                  className="flex gap-4 rounded-xl border border-slate-800 bg-slate-950/70 p-4"
+                <input
+                  placeholder="Health endpoint"
+                  value={healthEndpoint}
+                  onChange={(event) =>
+                    setHealthEndpoint(
+                      event.target.value
+                    )
+                  }
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
+                />
+
+                <select
+                  value={environment}
+                  onChange={(event) =>
+                    setEnvironment(
+                      event.target.value
+                    )
+                  }
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
                 >
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-800">
-                    {getTraceIcon(item.type)}
-                  </div>
+                  <option value="development">
+                    Development
+                  </option>
 
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-3">
-                      <span className="text-xs font-semibold text-slate-500">
-                        STEP {item.step}
-                      </span>
+                  <option value="staging">
+                    Staging
+                  </option>
 
-                      <span className="text-xs uppercase tracking-wider text-cyan-400">
-                        {item.type.replace("_", " ")}
-                      </span>
+                  <option value="production">
+                    Production
+                  </option>
+                </select>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full rounded-lg bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-950 disabled:opacity-50"
+                >
+                  Create Project
+                </button>
+              </form>
+            </div>
+          </aside>
+
+          <section className="space-y-6">
+            {!selectedProject ? (
+              <div className="rounded-2xl border border-slate-800 bg-slate-900 p-8">
+                <h2 className="text-xl font-semibold">
+                  Select a project
+                </h2>
+
+                <p className="mt-2 text-sm text-slate-400">
+                  Create or select a project before
+                  using OpsPilot.
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+                  <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                    <div>
+                      <p className="text-xs uppercase tracking-wide text-cyan-400">
+                        Selected Project
+                      </p>
+
+                      <h2 className="mt-1 text-2xl font-bold">
+                        {selectedProject.name}
+                      </h2>
+
+                      <p className="mt-2 text-sm text-slate-400">
+                        Environment:{" "}
+                        {selectedProject.environment}
+                      </p>
+
+                      <p className="text-sm text-slate-400">
+                        Deployment:{" "}
+                        {selectedProject.deployment_status}
+                      </p>
+
+                      <p className="text-sm text-slate-400">
+                        Version:{" "}
+                        {selectedProject.current_version}
+                      </p>
                     </div>
 
-                    {item.tool && (
-                      <p className="mt-1 font-mono text-sm text-slate-200">
-                        {item.tool}
-                      </p>
-                    )}
+                    <button
+                      onClick={simulateIncident}
+                      disabled={loading}
+                      className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-300 disabled:opacity-50"
+                    >
+                      Simulate Incident
+                    </button>
+                  </div>
+                </div>
 
-                    {item.content && (
-                      <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-400">
-                        {item.content}
-                      </p>
-                    )}
+                <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h2 className="text-lg font-semibold">
+                        Ask OpsPilot
+                      </h2>
 
-                    {item.result && (
-                      <pre className="mt-2 overflow-x-auto rounded-lg bg-black/30 p-3 text-xs leading-5 text-slate-400">
-                        {JSON.stringify(item.result, null, 2)}
-                      </pre>
+                      <p className="mt-1 text-sm text-slate-400">
+                        OpsPilot is operating on the
+                        selected project.
+                      </p>
+                    </div>
+
+                    <span className="rounded-full bg-cyan-500/10 px-3 py-1 text-xs text-cyan-400">
+                      Project #{selectedProject.id}
+                    </span>
+                  </div>
+
+                  <textarea
+                    value={goal}
+                    onChange={(event) =>
+                      setGoal(event.target.value)
+                    }
+                    rows={4}
+                    className="mt-5 w-full rounded-xl border border-slate-700 bg-slate-950 p-4 text-sm outline-none focus:border-cyan-400"
+                  />
+
+                  <button
+                    onClick={runAgent}
+                    disabled={loading}
+                    className="mt-4 rounded-lg bg-cyan-500 px-5 py-3 font-semibold text-slate-950 disabled:opacity-50"
+                  >
+                    {loading
+                      ? "OpsPilot is working..."
+                      : "Run OpsPilot Agent"}
+                  </button>
+                </div>
+
+                {agentResult && (
+                  <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+                    <h2 className="text-lg font-semibold">
+                      Investigation Trace
+                    </h2>
+
+                    <div className="mt-4 space-y-3">
+                      {agentResult.trace.map(
+                        (entry, index) => (
+                          <div
+                            key={index}
+                            className="rounded-xl border border-slate-800 bg-slate-950 p-4"
+                          >
+                            <p className="text-xs uppercase tracking-wide text-slate-500">
+                              {String(entry.type)}
+                            </p>
+
+                            <pre className="mt-2 whitespace-pre-wrap text-xs text-slate-300">
+                              {JSON.stringify(
+                                entry,
+                                null,
+                                2
+                              )}
+                            </pre>
+                          </div>
+                        )
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h2 className="text-lg font-semibold">
+                        Human Approvals
+                      </h2>
+
+                      <p className="mt-1 text-sm text-slate-400">
+                        Risky operations require approval.
+                      </p>
+                    </div>
+
+                    <button
+                      onClick={() =>
+                        void loadApprovals(
+                          selectedProject.id
+                        )
+                      }
+                      className="text-sm text-cyan-400"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+
+                  <button
+                    onClick={createRollbackApproval}
+                    disabled={loading}
+                    className="mt-5 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2 text-sm text-red-300 disabled:opacity-50"
+                  >
+                    Create Rollback Approval
+                  </button>
+
+                  <div className="mt-4 space-y-3">
+                    {approvals.length === 0 ? (
+                      <p className="text-sm text-slate-500">
+                        No approval requests.
+                      </p>
+                    ) : (
+                      approvals.map((approval) => (
+                        <div
+                          key={approval.id}
+                          className="rounded-xl border border-slate-800 bg-slate-950 p-4"
+                        >
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="font-medium">
+                                #{approval.id}{" "}
+                                {approval.tool}
+                              </p>
+
+                              <p className="mt-1 text-xs text-slate-500">
+                                {approval.status}
+                              </p>
+                            </div>
+
+                            {approval.status ===
+                              "pending" && (
+                              <button
+                                onClick={() =>
+                                  approveRollback(
+                                    approval.id
+                                  )
+                                }
+                                disabled={loading}
+                                className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 disabled:opacity-50"
+                              >
+                                Approve
+                              </button>
+                            )}
+                          </div>
+
+                          {approval.result && (
+                            <pre className="mt-3 whitespace-pre-wrap text-xs text-slate-400">
+                              {JSON.stringify(
+                                approval.result,
+                                null,
+                                2
+                              )}
+                            </pre>
+                          )}
+                        </div>
+                      ))
                     )}
                   </div>
                 </div>
-              ))}
-            </div>
-          )}
-        </section>
 
-        {/* Recovery evidence */}
-        {recoveryVerified && (
-          <section className="mt-6 grid gap-6 md:grid-cols-2">
-            <EvidenceCard
-              title="Deployment verification"
-              icon="🚀"
-              value={deployment?.version ?? "1.0.0"}
-              detail="Healthy deployment"
-            />
+                <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+                  <h2 className="text-lg font-semibold">
+                    DevOps Improvement Report
+                  </h2>
 
-            <EvidenceCard
-              title="Application verification"
-              icon="❤️"
-              value="Healthy"
-              detail="Health check passed"
-            />
+                  <div className="mt-4 grid gap-4 md:grid-cols-2">
+                    <div>
+                      <h3 className="font-medium text-cyan-400">
+                        Findings
+                      </h3>
+
+                      <ul className="mt-2 space-y-2 text-sm text-slate-400">
+                        <li>
+                          Database connection failures
+                        </li>
+
+                        <li>
+                          Request failures and HTTP 500
+                          errors
+                        </li>
+
+                        <li>
+                          Unhealthy deployment detected
+                        </li>
+                      </ul>
+                    </div>
+
+                    <div>
+                      <h3 className="font-medium text-cyan-400">
+                        Recommendations
+                      </h3>
+
+                      <ul className="mt-2 space-y-2 text-sm text-slate-400">
+                        <li>
+                          Validate database configuration
+                          in CI
+                        </li>
+
+                        <li>
+                          Add post-deployment health
+                          checks
+                        </li>
+
+                        <li>
+                          Define rollback thresholds
+                        </li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
           </section>
-        )}
-
-        {/* DevOps Improvement Report */}
-        <section className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-widest text-cyan-400">
-                Continuous improvement
-              </p>
-
-              <h2 className="mt-1 text-xl font-bold">
-                DevOps Improvement Report
-              </h2>
-
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-400">
-                OpsPilot converts incident evidence into actionable
-                improvements for the software delivery and operations
-                process.
-              </p>
-            </div>
-
-            <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-xs font-medium text-cyan-300">
-              POST-INCIDENT
-            </div>
-          </div>
-
-          <div className="mt-6 grid gap-6 lg:grid-cols-2">
-            {/* Findings */}
-            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-5">
-              <h3 className="font-semibold text-slate-200">
-                Incident findings
-              </h3>
-
-              <ul className="mt-4 space-y-3 text-sm text-slate-400">
-                <li className="flex gap-3">
-                  <span className="text-red-400">●</span>
-                  Database connection failures were detected.
-                </li>
-
-                <li className="flex gap-3">
-                  <span className="text-red-400">●</span>
-                  Database connection timeouts caused request failures.
-                </li>
-
-                <li className="flex gap-3">
-                  <span className="text-red-400">●</span>
-                  HTTP 500 responses and failed health checks occurred.
-                </li>
-
-                <li className="flex gap-3">
-                  <span className="text-amber-400">●</span>
-                  The failure was associated with deployment 1.0.1.
-                </li>
-
-                <li className="flex gap-3">
-                  <span className="text-emerald-400">●</span>
-                  Rollback to 1.0.0 restored application health.
-                </li>
-              </ul>
-            </div>
-
-            {/* Recommendations */}
-            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-5">
-              <h3 className="font-semibold text-slate-200">
-                Recommended improvements
-              </h3>
-
-              <div className="mt-4 space-y-3">
-                <ImprovementItem
-                  number="01"
-                  title="Validate database configuration in CI"
-                  detail="Check required database settings before deployment."
-                />
-
-                <ImprovementItem
-                  number="02"
-                  title="Add database connectivity tests"
-                  detail="Verify application-to-database connectivity before release."
-                />
-
-                <ImprovementItem
-                  number="03"
-                  title="Add post-deployment health checks"
-                  detail="Verify service health before considering a deployment successful."
-                />
-
-                <ImprovementItem
-                  number="04"
-                  title="Define rollback thresholds"
-                  detail="Use measurable health and error-rate conditions to trigger remediation workflows."
-                />
-
-                <ImprovementItem
-                  number="05"
-                  title="Block unhealthy releases"
-                  detail="Prevent failed health verification from being treated as a successful deployment."
-                />
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-6 rounded-xl border border-cyan-500/20 bg-cyan-500/5 p-4">
-            <div className="flex items-center gap-3">
-              <span className="text-xl">📈</span>
-
-              <div>
-                <p className="text-sm font-semibold text-cyan-300">
-                  DevOps focus
-                </p>
-
-                <p className="mt-1 text-xs leading-5 text-slate-400">
-                  Improve deployment reliability by moving validation
-                  earlier in the delivery pipeline and verifying system
-                  health after deployment.
-                </p>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* Architecture */}
-        <section className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
-          <p className="text-xs font-semibold uppercase tracking-widest text-cyan-400">
-            Agent architecture
-          </p>
-
-          <div className="mt-5 grid gap-3 text-center text-sm md:grid-cols-5">
-            <ArchitectureStep label="User Goal" icon="🎯" />
-            <ArchitectureStep label="AI Agent" icon="🤖" />
-            <ArchitectureStep label="Tool Registry" icon="🔧" />
-            <ArchitectureStep label="DevOps System" icon="⚙️" />
-            <ArchitectureStep label="Verified Result" icon="✅" />
-          </div>
         </section>
       </div>
     </main>
-  );
-}
-
-function StatusCard({
-  title,
-  value,
-  detail,
-}: {
-  title: string;
-  value: string;
-  detail: string;
-}) {
-  return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
-      <div className="flex items-center justify-between">
-        <span className="text-sm text-slate-400">{title}</span>
-
-        <span className="h-2.5 w-2.5 rounded-full bg-emerald-400" />
-      </div>
-
-      <p className="mt-3 text-xl font-bold">{value}</p>
-
-      <p className="mt-1 text-xs text-slate-500">{detail}</p>
-    </div>
-  );
-}
-
-function InfoRow({
-  label,
-  value,
-  valueClass = "text-slate-200",
-}: {
-  label: string;
-  value: string;
-  valueClass?: string;
-}) {
-  return (
-    <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-      <span className="text-sm text-slate-500">{label}</span>
-
-      <span className={`text-sm font-medium ${valueClass}`}>
-        {value}
-      </span>
-    </div>
-  );
-}
-
-function EvidenceCard({
-  title,
-  icon,
-  value,
-  detail,
-}: {
-  title: string;
-  icon: string;
-  value: string;
-  detail: string;
-}) {
-  return (
-    <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-5">
-      <div className="flex items-center gap-3">
-        <span className="text-xl">{icon}</span>
-
-        <div>
-          <p className="text-sm font-semibold text-emerald-300">
-            {title}
-          </p>
-
-          <p className="mt-1 text-xs text-slate-500">
-            {detail}
-          </p>
-        </div>
-      </div>
-
-      <p className="mt-4 text-2xl font-bold text-white">
-        {value}
-      </p>
-    </div>
-  );
-}
-
-function ImprovementItem({
-  number,
-  title,
-  detail,
-}: {
-  number: string;
-  title: string;
-  detail: string;
-}) {
-  return (
-    <div className="flex gap-3 rounded-lg border border-slate-800 p-3">
-      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-cyan-500/10 text-xs font-bold text-cyan-400">
-        {number}
-      </div>
-
-      <div>
-        <p className="text-sm font-medium text-slate-200">
-          {title}
-        </p>
-
-        <p className="mt-1 text-xs leading-5 text-slate-500">
-          {detail}
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function ArchitectureStep({
-  label,
-  icon,
-}: {
-  label: string;
-  icon: string;
-}) {
-  return (
-    <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
-      <div className="text-xl">{icon}</div>
-
-      <p className="mt-2 text-xs font-medium text-slate-300">
-        {label}
-      </p>
-    </div>
   );
 }

@@ -67,7 +67,7 @@ def run_agent_turn(
     tool_schemas: list[dict],
     tool_executor,
 ) -> dict:
-    MAX_STEPS = 5
+    MAX_STEPS = 10
 
     client = get_ai_client()
 
