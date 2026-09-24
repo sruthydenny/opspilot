@@ -1,8 +1,8 @@
 services:
-
   api:
     build:
-      context: ./backend
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: opspilot-api
     ports:
       - "8000:8000"
@@ -15,6 +15,9 @@ services:
       POSTGRES_PASSWORD: opspilot_dev_password
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      AI_MODEL: ${AI_MODEL:-openrouter/free}
+      INCIDENT_MODE: "true"
     depends_on:
       postgres:
         condition: service_healthy
